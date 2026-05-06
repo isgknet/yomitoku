@@ -8,9 +8,10 @@ import torch
 from PIL import Image
 
 from ..constants import SUPPORT_OUTPUT_FORMAT
-from ..data.functions import load_image, load_pdf
+from ..data.functions import load_epub, load_image, load_pdf
 from ..document_analyzer import DocumentAnalyzer
 from ..utils.logger import set_logger
+from ..utils.searchable_epub import create_searchable_epub
 from ..utils.searchable_pdf import create_searchable_pdf
 
 from ..export import save_csv, save_html, save_json, save_markdown
@@ -56,19 +57,26 @@ def merge_all_pages(results):
                 out = [data]
             else:
                 out.append(data)
+
+        elif format == "epub":
+            if out is None:
+                out = [data]
+            else:
+                out.append(data)
     return out
 
 
-def save_merged_file(out_path, args, out, imgs):
-    if args.format == "json":
+def save_merged_file(out_path, args, out, imgs, format=None, book=None):
+    fmt = format if format is not None else args.format
+    if fmt == "json":
         save_json(out, out_path, args.encoding)
-    elif args.format == "csv":
+    elif fmt == "csv":
         save_csv(out, out_path, args.encoding)
-    elif args.format == "html":
+    elif fmt == "html":
         save_html(out, out_path, args.encoding)
-    elif args.format == "md":
+    elif fmt == "md":
         save_markdown(out, out_path, args.encoding)
-    elif args.format == "pdf":
+    elif fmt == "pdf":
         pil_images = [Image.fromarray(img[:, :, ::-1]) for img in imgs]
         create_searchable_pdf(
             pil_images,
@@ -76,6 +84,19 @@ def save_merged_file(out_path, args, out, imgs):
             output_path=out_path,
             font_path=args.font_path,
             image_quality=args.pdf_quality,
+        )
+    elif fmt == "epub":
+        if book is None:
+            raise ValueError(
+                "EPUB output requires EPUB input. Pass an .epub file as the input."
+            )
+        create_searchable_epub(
+            book,
+            out,
+            output_path=out_path,
+            font_path=args.font_path,
+            image_quality=args.epub_quality,
+            embed_font=not args.epub_no_embed_font,
         )
 
 
@@ -103,10 +124,30 @@ def parse_pages(pages_str):
 
 
 def process_single_file(args, analyzer, path, format):
-    if path.suffix[1:].lower() in ["pdf"]:
+    book = None
+    suffix = path.suffix[1:].lower()
+    if suffix == "pdf":
         imgs = load_pdf(path, dpi=args.dpi)
+    elif suffix == "epub":
+        book = load_epub(path)
+        imgs = book
+        if format != "epub":
+            raise ValueError(
+                f"EPUB input is currently only supported with -f epub (got -f {format})"
+            )
     else:
         imgs = load_image(path)
+        if format == "epub":
+            raise ValueError(
+                "EPUB output requires EPUB input. Pass an .epub file as the input."
+            )
+
+    # `-o foo.epub` のようにファイル名で出力先を指定された場合、
+    # ページごとの中間ファイルは親ディレクトリに置く。
+    if format == "epub" and args.outdir.lower().endswith(".epub"):
+        intermediate_dir = os.path.dirname(args.outdir) or "."
+    else:
+        intermediate_dir = args.outdir
 
     target_pages = range(1, len(imgs) + 1)
     if args.pages is not None:
@@ -124,12 +165,12 @@ def process_single_file(args, analyzer, path, format):
         import cv2
 
         cv2.imwrite(
-            os.path.join(args.outdir, f"{dirname}_{filename}_p{page + 1}.jpg"), img
+            os.path.join(intermediate_dir, f"{dirname}_{filename}_p{page + 1}.jpg"), img
         )
 
         if ocr is not None:
             out_path = os.path.join(
-                args.outdir, f"{dirname}_{filename}_p{page + 1}_ocr.jpg"
+                intermediate_dir, f"{dirname}_{filename}_p{page + 1}_ocr.jpg"
             )
 
             save_image(ocr, out_path)
@@ -137,14 +178,14 @@ def process_single_file(args, analyzer, path, format):
 
         if layout is not None:
             out_path = os.path.join(
-                args.outdir, f"{dirname}_{filename}_p{page + 1}_layout.jpg"
+                intermediate_dir, f"{dirname}_{filename}_p{page + 1}_layout.jpg"
             )
 
             save_image(layout, out_path)
             logger.info(f"Output file: {out_path}")
 
         out_path = os.path.join(
-            args.outdir, f"{dirname}_{filename}_p{page + 1}.{format}"
+            intermediate_dir, f"{dirname}_{filename}_p{page + 1}.{format}"
         )
 
         if format == "json":
@@ -281,16 +322,35 @@ def process_single_file(args, analyzer, path, format):
                     "data": result,
                 }
             )
+        elif format == "epub":
+            format_results.append(
+                {
+                    "format": format,
+                    "data": result,
+                }
+            )
 
     out = merge_all_pages(format_results)
-    if args.combine:
-        out_path = os.path.join(args.outdir, f"{dirname}_{filename}.{format}")
+    # EPUB 出力は --combine の有無に関わらず単一コンテナにまとめる
+    if args.combine or format == "epub":
+        out_path = _resolve_combined_out_path(args, dirname, filename, format)
         save_merged_file(
             out_path,
             args,
             out,
             imgs,
+            format=format,
+            book=book,
         )
+
+
+def _resolve_combined_out_path(args, dirname, filename, format):
+    """combine 出力時のパスを決定する。EPUB の場合は `-o foo.epub` のように
+    出力ファイル名を直接指定可能、それ以外は `-o` をディレクトリとして扱う。"""
+    if format == "epub" and args.outdir.lower().endswith(".epub"):
+        Path(args.outdir).parent.mkdir(parents=True, exist_ok=True)
+        return args.outdir
+    return os.path.join(args.outdir, f"{dirname}_{filename}.{format}")
 
 
 def main():
@@ -304,8 +364,11 @@ def main():
         "-f",
         "--format",
         type=str,
-        default="json",
-        help="output format type (json or csv or html or md)",
+        default=None,
+        help=(
+            "output format type (json, csv, html, md, pdf, epub). "
+            "Defaults to 'epub' for .epub input and 'json' otherwise."
+        ),
     )
     parser.add_argument(
         "-v",
@@ -420,6 +483,21 @@ def main():
         help="Image quality preset for PDF output (default: high)",
     )
     parser.add_argument(
+        "--epub_quality",
+        type=str,
+        default="high",
+        choices=["high", "middle", "low"],
+        help="Image quality preset for EPUB output (default: high)",
+    )
+    parser.add_argument(
+        "--epub_no_embed_font",
+        action="store_true",
+        help=(
+            "if set, do not embed the bundled M+ TTF inside the EPUB. "
+            "Smaller output but selection accuracy may degrade in some readers."
+        ),
+    )
+    parser.add_argument(
         "--dpi",
         type=int,
         default=200,
@@ -459,7 +537,14 @@ def main():
     if not path.exists():
         raise FileNotFoundError(f"File not found: {args.arg1}")
 
-    format = args.format.lower()
+    if args.format is None:
+        if path.is_file() and path.suffix[1:].lower() == "epub":
+            format = "epub"
+        else:
+            format = "json"
+    else:
+        format = args.format.lower()
+
     if format not in SUPPORT_OUTPUT_FORMAT:
         raise ValueError(
             f"Invalid output format: {args.format}. Supported formats are {SUPPORT_OUTPUT_FORMAT}"
@@ -468,7 +553,7 @@ def main():
     if (
         args.font_path is not None
         and not os.path.exists(args.font_path)
-        and format == "pdf"
+        and format in ("pdf", "epub")
     ):
         raise FileNotFoundError(f"Font file not found: {args.font_path}")
 
@@ -476,6 +561,8 @@ def main():
 
     if format == "markdown":
         format = "md"
+    if format == "searchable-epub":
+        format = "epub"
 
     configs = {
         "ocr": {
@@ -523,8 +610,13 @@ def main():
         ruby_threshold=args.ruby_threshold,
     )
 
-    os.makedirs(args.outdir, exist_ok=True)
-    logger.info(f"Output directory: {args.outdir}")
+    if format == "epub" and args.outdir.lower().endswith(".epub"):
+        out_parent = os.path.dirname(args.outdir) or "."
+        os.makedirs(out_parent, exist_ok=True)
+        logger.info(f"Output file: {args.outdir}")
+    else:
+        os.makedirs(args.outdir, exist_ok=True)
+        logger.info(f"Output directory: {args.outdir}")
 
     if path.is_dir():
         all_files = [f for f in path.rglob("*") if f.is_file()]
