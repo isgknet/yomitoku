@@ -1,8 +1,17 @@
 import os
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-SUPPORT_OUTPUT_FORMAT = ["json", "csv", "html", "markdown", "md", "pdf"]
-SUPPORT_INPUT_FORMAT = ["jpg", "jpeg", "png", "bmp", "tiff", "tif", "pdf"]
+SUPPORT_OUTPUT_FORMAT = [
+    "json",
+    "csv",
+    "html",
+    "markdown",
+    "md",
+    "pdf",
+    "epub",
+    "searchable-epub",
+]
+SUPPORT_INPUT_FORMAT = ["jpg", "jpeg", "png", "bmp", "tiff", "tif", "pdf", "epub"]
 MIN_IMAGE_SIZE = 32
 WARNING_IMAGE_SIZE = 720
 
