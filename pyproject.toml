@@ -57,9 +57,11 @@ dev-dependencies = [
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", marker = "platform_system == 'Darwin'"},
+    { index = "pytorch-cuda124", marker = "sys_platform == 'win32'"},
 ]
 torchvision = [
     { index = "pytorch-cpu", marker = "platform_system == 'Darwin'"},
+    { index = "pytorch-cuda124", marker = "sys_platform == 'win32'"},
 ]
 
 [[tool.uv.index]]
@@ -75,6 +77,7 @@ explicit = true
 [project.scripts]
 yomitoku = "yomitoku.cli.main:main"
 yomitoku_mcp = "yomitoku.cli.mcp_server:main"
+yomitoku_gui = "yomitoku.cli.gui:main"
 download_model = "yomitoku.cli.download_model:main"
 yomitoku_extract = "yomitoku.cli.extract_rule:main"
 yomitoku_extract_with_llm = "yomitoku.cli.extract:main"
@@ -86,6 +89,9 @@ mcp = [
 extract = [
     "openai>=1.0.0",
     "pyyaml>=6.0",
+]
+gui = [
+    "gradio>=4.0",
 ]
 
 [tool.tox]
