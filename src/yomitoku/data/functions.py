@@ -1,10 +1,15 @@
+import io
+import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import cv2
 from PIL import Image
 import numpy as np
 import torch
 import pypdfium2
+from lxml import etree
 
 from ..constants import (
     MIN_IMAGE_SIZE,
@@ -53,6 +58,11 @@ def load_image(image_path: str) -> np.ndarray:
     if ext == "pdf":
         raise ValueError(
             "PDF file is not supported by load_image(). Use load_pdf() instead."
+        )
+
+    if ext == "epub":
+        raise ValueError(
+            "EPUB file is not supported by load_image(). Use load_epub() instead."
         )
 
     try:
@@ -191,6 +201,309 @@ def load_pdf(pdf_path: str, dpi=200) -> PdfPageIterator:
         )
 
     return PdfPageIterator(pdf_path, dpi=dpi)
+
+
+# ---- EPUB ----------------------------------------------------------------
+
+_EPUB_RASTER_EXTS = {"jpg", "jpeg", "png", "bmp", "tif", "tiff", "gif", "webp"}
+
+
+def _normalize_zip_path(base_dir: str, href: str) -> str:
+    """zip 内部での `href` を `base_dir` 起点に解決する (区切りは "/")。"""
+    href = href.split("#", 1)[0]
+    if href.startswith("/"):
+        parts: List[str] = []
+        for p in href.lstrip("/").split("/"):
+            if p in ("", "."):
+                continue
+            if p == ".." and parts:
+                parts.pop()
+            else:
+                parts.append(p)
+        return "/".join(parts)
+
+    parts = [p for p in base_dir.split("/") if p] if base_dir else []
+    for p in href.split("/"):
+        if p in ("", "."):
+            continue
+        if p == "..":
+            if parts:
+                parts.pop()
+        else:
+            parts.append(p)
+    return "/".join(parts)
+
+
+def _local(name: str) -> str:
+    return f"*[local-name()='{name}']"
+
+
+@dataclass
+class EpubPageRef:
+    """`load_epub` が記録する spine エントリ単位のメタデータ。
+
+    OCR 対象ページは `skip_reason is None` かつ `image_zip_path` を保持。
+    非対象ページも `skip_reason` 付きで記録し、EPUB をそのままラウンドトリップ
+    できるようにする。
+    """
+
+    xhtml_path: str
+    image_zip_path: Optional[str] = None
+    image_src_in_xhtml: Optional[str] = None
+    image_pixel_size: Optional[Tuple[int, int]] = None
+    skip_reason: Optional[str] = None
+    eligible_index: Optional[int] = None
+
+
+@dataclass
+class EpubBook:
+    """EPUB ファイルへの遅延ビュー。OCR 用の画像ソースと、
+    `create_searchable_epub` が再パッケージする際の構造化コンテナを兼ねる。
+
+    イテレーション / `len` / `__getitem__` は OCR 対象ページのみを BGR
+    `np.ndarray` として返す。`load_image` / `load_pdf` を呼んでいた既存コードに
+    そのまま差し込める。
+    """
+
+    src_path: Path
+    opf_path: str
+    opf_dir: str
+    page_refs: List[EpubPageRef] = field(default_factory=list)
+    _eligible_refs: List[EpubPageRef] = field(default_factory=list, repr=False)
+
+    def __post_init__(self):
+        self._eligible_refs = [r for r in self.page_refs if r.skip_reason is None]
+        for i, r in enumerate(self._eligible_refs):
+            r.eligible_index = i
+
+    def __len__(self) -> int:
+        return len(self._eligible_refs)
+
+    def __iter__(self):
+        with zipfile.ZipFile(self.src_path, "r") as zf:
+            for ref in self._eligible_refs:
+                yield self._decode(zf, ref)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            indices = range(*index.indices(len(self._eligible_refs)))
+            with zipfile.ZipFile(self.src_path, "r") as zf:
+                return [self._decode(zf, self._eligible_refs[i]) for i in indices]
+
+        if isinstance(index, int):
+            n = len(self._eligible_refs)
+            if index < 0:
+                index += n
+            if not (0 <= index < n):
+                raise IndexError(f"page index {index} out of range")
+            with zipfile.ZipFile(self.src_path, "r") as zf:
+                return self._decode(zf, self._eligible_refs[index])
+
+        raise TypeError(
+            f"indices must be integers or slices, not {type(index).__name__}"
+        )
+
+    @staticmethod
+    def _decode(zf: zipfile.ZipFile, ref: EpubPageRef) -> np.ndarray:
+        with zf.open(ref.image_zip_path) as fp:
+            data = fp.read()
+        try:
+            pil = Image.open(io.BytesIO(data)).convert("RGB")
+        except Exception as e:
+            raise ValueError(
+                f"Failed to decode image '{ref.image_zip_path}' inside EPUB"
+            ) from e
+        arr = np.array(pil)[:, :, ::-1]
+        validate_image(arr)
+        return arr
+
+
+def _xhtml_image_eligibility(
+    xhtml_bytes: bytes,
+    xhtml_zip_path: str,
+    zf: zipfile.ZipFile,
+):
+    """spine の XHTML 1 ページを検査し、含まれる画像 (あれば) を OCR 対象に
+    すべきか判定する。
+
+    戻り値: (image_zip_path, src_attr, (W, H), skip_reason)。OCR 対象なら
+    `skip_reason` が None で他 3 値が埋まる。非対象なら `skip_reason` のみ。
+    """
+    try:
+        root = etree.fromstring(
+            xhtml_bytes, parser=etree.XMLParser(recover=True, resolve_entities=False)
+        )
+    except Exception:
+        try:
+            root = etree.HTML(xhtml_bytes)
+        except Exception:
+            return None, None, None, "parse_error"
+
+    if root is None:
+        return None, None, None, "parse_error"
+
+    # SVG <image> はベクター埋め込みのため OCR 対象外
+    svg_images = root.xpath(f".//{_local('svg')}//{_local('image')}")
+    if svg_images:
+        return None, None, None, "svg_image"
+
+    imgs = root.xpath(f".//{_local('img')}")
+    if len(imgs) == 0:
+        return None, None, None, "no_image"
+    if len(imgs) > 1:
+        return None, None, None, "multiple_images"
+
+    img_el = imgs[0]
+    src = img_el.get("src") or img_el.get("{http://www.w3.org/1999/xlink}href")
+    if not src:
+        return None, None, None, "no_image"
+
+    # body 内テキスト判定: 画像を除外した残りに有意なテキストがあるかを確認
+    bodies = root.xpath(f".//{_local('body')}")
+    if bodies:
+        body_copy = etree.fromstring(etree.tostring(bodies[0]))
+        for el in body_copy.xpath(f".//{_local('img')}"):
+            parent = el.getparent()
+            if parent is not None:
+                parent.remove(el)
+        text = "".join(body_copy.itertext()) or ""
+        if text.strip():
+            return None, None, None, "text_and_image"
+
+    ext = src.rsplit(".", 1)[-1].lower().split("?")[0]
+    if ext not in _EPUB_RASTER_EXTS:
+        return None, None, None, "non_raster_image"
+
+    xhtml_dir = "/".join(xhtml_zip_path.split("/")[:-1])
+    img_zip_path = _normalize_zip_path(xhtml_dir, src)
+
+    if img_zip_path not in zf.namelist():
+        return None, None, None, "image_not_found"
+
+    try:
+        with zf.open(img_zip_path) as fp:
+            pil = Image.open(io.BytesIO(fp.read()))
+            w, h = pil.size
+    except Exception:
+        return None, None, None, "image_decode_error"
+
+    return img_zip_path, src, (w, h), None
+
+
+def load_epub(epub_path: str) -> EpubBook:
+    """画像ベース EPUB を開いて `EpubBook` ビューを生成する。
+
+    body に単一のラスタ `<img>` のみを持ち、他に有意なテキストが無い spine
+    の XHTML だけを OCR 対象として公開する。それ以外のページは `skip_reason`
+    付きで `book.page_refs` に残し、`create_searchable_epub` が原本のまま
+    コピーできるようにする。
+
+    Args:
+        epub_path: .epub ファイルのパス。
+
+    Returns:
+        OCR 対象ページごとに BGR の `np.ndarray` を返すイテレータを持つ
+        `EpubBook`。
+    """
+    epub_path = Path(epub_path)
+    if not epub_path.exists():
+        raise FileNotFoundError(f"File not found: {epub_path}")
+
+    ext = epub_path.suffix[1:].lower()
+    if ext not in SUPPORT_INPUT_FORMAT:
+        raise ValueError(
+            f"Unsupported image format. Supported formats are {SUPPORT_INPUT_FORMAT}"
+        )
+    if ext != "epub":
+        raise ValueError(
+            "non-EPUB file is not supported by load_epub(). "
+            "Use load_image() or load_pdf() instead."
+        )
+
+    try:
+        zf = zipfile.ZipFile(epub_path, "r")
+    except zipfile.BadZipFile as e:
+        raise ValueError(f"Invalid EPUB (not a valid zip): {epub_path}") from e
+
+    try:
+        names = set(zf.namelist())
+        if "META-INF/container.xml" not in names:
+            raise ValueError(
+                f"Invalid EPUB (missing META-INF/container.xml): {epub_path}"
+            )
+
+        container_bytes = zf.read("META-INF/container.xml")
+        container = etree.fromstring(container_bytes)
+        rootfiles = container.xpath(f".//{_local('rootfile')}")
+        if not rootfiles:
+            raise ValueError(f"Invalid EPUB (no rootfile entry): {epub_path}")
+
+        opf_path = rootfiles[0].get("full-path")
+        if not opf_path:
+            raise ValueError(f"Invalid EPUB (rootfile has no full-path): {epub_path}")
+
+        opf_dir = "/".join(opf_path.split("/")[:-1])
+        opf_bytes = zf.read(opf_path)
+        opf = etree.fromstring(opf_bytes)
+
+        manifest_items = opf.xpath(f".//{_local('manifest')}/{_local('item')}")
+        manifest = {}
+        for item in manifest_items:
+            iid = item.get("id")
+            href = item.get("href")
+            if iid and href:
+                manifest[iid] = _normalize_zip_path(opf_dir, href)
+
+        spine_refs = opf.xpath(f".//{_local('spine')}/{_local('itemref')}")
+        if not spine_refs:
+            raise ValueError(f"Invalid EPUB (empty spine): {epub_path}")
+
+        page_refs: List[EpubPageRef] = []
+        for itemref in spine_refs:
+            idref = itemref.get("idref")
+            if not idref or idref not in manifest:
+                continue
+
+            xhtml_path = manifest[idref]
+            if xhtml_path not in names:
+                page_refs.append(
+                    EpubPageRef(xhtml_path=xhtml_path, skip_reason="missing_in_zip")
+                )
+                continue
+
+            xhtml_bytes = zf.read(xhtml_path)
+            img_zip_path, src, size, reason = _xhtml_image_eligibility(
+                xhtml_bytes, xhtml_path, zf
+            )
+            if reason is not None:
+                page_refs.append(EpubPageRef(xhtml_path=xhtml_path, skip_reason=reason))
+                continue
+
+            page_refs.append(
+                EpubPageRef(
+                    xhtml_path=xhtml_path,
+                    image_zip_path=img_zip_path,
+                    image_src_in_xhtml=src,
+                    image_pixel_size=size,
+                )
+            )
+    finally:
+        zf.close()
+
+    book = EpubBook(
+        src_path=epub_path,
+        opf_path=opf_path,
+        opf_dir=opf_dir,
+        page_refs=page_refs,
+    )
+
+    skipped = [r for r in page_refs if r.skip_reason is not None]
+    if skipped:
+        logger.info(
+            f"EPUB load: {len(book)} eligible page(s), {len(skipped)} skipped "
+            f"({', '.join(sorted({r.skip_reason for r in skipped}))})"
+        )
+    return book
 
 
 def resize_shortest_edge(
